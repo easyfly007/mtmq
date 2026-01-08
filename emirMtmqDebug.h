@@ -2,6 +2,8 @@
 #define EMIRMTMQDEBUG_H
 
 #include <iostream>
+#include <sstream>
+#include <string>
 #include <pthread.h>
 
 // ============================================================================
@@ -27,14 +29,14 @@ public:
     ~EmirMtmqDebug();
     
     // Overload << operator for various types
-    // Lock mutex before output, unlock after output
-    // Each << operation is atomic (locked separately)
+    // Write to thread-local buffer, flush only when endl or flush is encountered
     template<typename T>
     EmirMtmqDebug& operator<<(const T& value) {
-        pthread_mutex_lock(&_output_mutex);
-        std::cout << value;
-        std::cout.flush();  // Ensure immediate output
-        pthread_mutex_unlock(&_output_mutex);
+        // Get thread-local buffer
+        std::ostringstream* buffer = getThreadBuffer();
+        if (buffer) {
+            *buffer << value;
+        }
         return *this;
     }
     
@@ -42,22 +44,72 @@ public:
     // These are function pointers, need special handling
     typedef std::ostream& (*StreamManipulator)(std::ostream&);
     EmirMtmqDebug& operator<<(StreamManipulator manip) {
-        pthread_mutex_lock(&_output_mutex);
-        manip(std::cout);
-        std::cout.flush();
-        pthread_mutex_unlock(&_output_mutex);
+        std::ostringstream* buffer = getThreadBuffer();
+        if (buffer) {
+            // Save buffer content before applying manipulator
+            std::string before = buffer->str();
+            
+            // Apply manipulator to buffer
+            manip(*buffer);
+            
+            // Get buffer content after applying manipulator
+            std::string after = buffer->str();
+            
+            // Check if manipulator is endl or flush by comparing function pointers
+            // Also check if buffer content changed (endl adds newline, flush doesn't change content but triggers flush)
+            bool is_endl = false;
+            bool is_flush = false;
+            
+            // Try to compare function pointers (may not work reliably in C++98/03 for templates)
+            // As fallback, check if endl was applied (buffer content changed and contains newline)
+            if (manip == static_cast<StreamManipulator>(std::endl)) {
+                is_endl = true;
+            } else if (manip == static_cast<StreamManipulator>(std::flush)) {
+                is_flush = true;
+            } else {
+                // Fallback: check if buffer content changed and contains newline (likely endl)
+                // Note: This is not 100% reliable but works for most cases
+                if (after.length() > before.length()) {
+                    // Check if new content ends with newline
+                    size_t new_content_start = before.length();
+                    std::string new_content = after.substr(new_content_start);
+                    if (new_content.find('\n') != std::string::npos) {
+                        is_endl = true;
+                    }
+                }
+            }
+            
+            // Only flush when endl or flush is encountered
+            if (is_endl || is_flush) {
+                flushBuffer();
+            }
+            // Other manipulators (like std::hex, std::dec, etc.) don't trigger flush
+        }
         return *this;
     }
 
 private:
     static pthread_mutex_t _output_mutex;  // Static mutex shared by all instances
     static bool _mutex_initialized;       // Flag to track mutex initialization
+    static pthread_key_t _buffer_key;      // Thread-local storage key for buffer
+    static bool _key_initialized;         // Flag to track key initialization
     
-    // Initialize mutex (called once)
+    // Get thread-local buffer (create if not exists)
+    std::ostringstream* getThreadBuffer();
+    
+    // Flush buffer to std::cout (thread-safe)
+    void flushBuffer();
+    
+    // Initialize mutex and thread-local storage key (called once)
     static void initMutex();
+    static void initKey();
     
-    // Destroy mutex (called once)
+    // Destroy mutex and thread-local storage key (called once)
     static void destroyMutex();
+    static void destroyKey();
+    
+    // Cleanup function for thread-local buffer (called when thread exits)
+    static void cleanupBuffer(void* ptr);
 };
 
 // Global instance for easy use
